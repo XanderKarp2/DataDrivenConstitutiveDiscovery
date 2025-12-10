@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 
 from sampling import ThermodynamicHMCMC, TensorOp
 from SINDy import DynamicSINDy
-from Bindy import BINDyRJ   # <<< BINDy import
+from Bindy import BINDyRJ   
 
 
 SEED = 0
@@ -518,7 +518,7 @@ if __name__ == "__main__":
         seed=SEED,
     )
 
-    # Recover FENE-P parameters from BINDy model using the same matched indices
+    # Recover FENE-P parameters from BINDy model
     ctau_B = float(coeffs_bindy_unscaled[j_tau])
     ctt_B = float(coeffs_bindy_unscaled[j_ttt])
     cti_B = float(coeffs_bindy_unscaled[j_ti])
@@ -544,7 +544,7 @@ if __name__ == "__main__":
         )
 
     # -----------------------------------------------------------
-    # 6. Save SINDy results (BINDy can be added similarly if you want)
+    # 6. Save SINDy results 
     # -----------------------------------------------------------
     np.savez_compressed(
         os.path.join(OUTDIR, "hmcmc_fenep_discovery_v2.npz"),
@@ -563,3 +563,4 @@ if __name__ == "__main__":
         threshold=THRESHOLD,
     )
     print(f"\nSaved {OUTDIR}/hmcmc_fenep_discovery_v2.npz")
+
