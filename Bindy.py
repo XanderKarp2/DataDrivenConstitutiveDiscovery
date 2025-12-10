@@ -1,4 +1,3 @@
-# bindy.py
 import numpy as np
 from numpy.linalg import inv, slogdet
 
@@ -163,7 +162,7 @@ class BINDyRJ:
         d = len(idx)
 
         if d == 0:
-            return -1e9  # strongly discourage empty model
+            return -1e9
 
         Sigma_m, mu_m = self._posterior_params_for_model(m_mask, sigma2)
         if Sigma_m is None:
@@ -181,9 +180,6 @@ class BINDyRJ:
 
         return -0.5 * logdet_Sigma0 + 0.5 * logdet_Sm + 0.5 * quad
 
-    # ------------------------------------------------------------------
-    # Gibbs-like update for sigma^2
-    # ------------------------------------------------------------------
     def _sample_sigma2(self, m_mask, sigma2_current):
         """
         Approximate IG posterior for sigma^2 using residuals at μ_m.
@@ -251,7 +247,7 @@ class BINDyRJ:
 
             # enforce minimum active terms
             if np.sum(m_prop) < self.min_active:
-                # skip proposal
+            
                 pass
             else:
                 log_post_m_prop = self._log_model_posterior_term(m_prop, sigma2)
@@ -300,3 +296,4 @@ class BINDyRJ:
             xi_samples[s] = xi_s
 
         return np.mean(xi_samples, axis=0)
+
