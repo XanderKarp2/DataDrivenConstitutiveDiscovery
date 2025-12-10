@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 
 from sampling import ThermodynamicHMCMC, TensorOp
 from SINDy import DynamicSINDy
+from Bindy import BINDyRJ   # <<< BINDy import
 
 
 SEED = 0
@@ -55,8 +56,10 @@ def make_simple_shear_L(gamma_dot: float) -> np.ndarray:
                      [0.0, 0.0,      0.0],
                      [0.0, 0.0,      0.0]], dtype=float)
 
+
 def sym(A):
     return 0.5 * (A + A.T)
+
 
 def finite_difference_dt(dt: float, X: np.ndarray) -> np.ndarray:
     dX = np.zeros_like(X)
@@ -71,6 +74,7 @@ def evolve_tau_truth(Wi, Lm, eta, L, D, tau, dt):
     relax = tau + (trt / (Lm**2)) * tau + (trt / (Lm**2)) * np.eye(3)
     dtau_dt = tau @ L + L.T @ tau + 2.0 * eta * D - (1.0 / Wi) * relax
     return sym(tau + dt * dtau_dt)
+
 
 def simulate_truth(dt, Lt, Wi, Lm, eta, gamma_dot, tau0):
     nt = int(Lt / dt)
@@ -94,6 +98,7 @@ def tau1_target(dt, tau, L):
     dtau = finite_difference_dt(dt, tau)
     return dtau - (tau @ L + L.T @ tau)
 
+
 def make_global_target(Wi, tau1, eta, D_hist):
     return Wi * (tau1 - 2.0 * eta * D_hist)
 
@@ -107,16 +112,39 @@ def component_row_weights(y_train, eps=1e-12, clip_max=10.0):
     w = np.clip(w, 0.0, clip_max)
     return w
 
+
 def expand_row_weights(w_comp, n_samples):
     return np.tile(w_comp.reshape(9), n_samples)
+
 
 def normalize_columns(Theta, eps=1e-12):
     s = np.linalg.norm(Theta, axis=0)
     s = np.maximum(s, eps)
     return Theta / s, s
 
+
 def build_theta(ds: DynamicSINDy, library, D, tau):
     return ds._build_library_matrix(library, D, tau)
+
+
+def build_weighted_design(ds, library, D_fit, tau_fit, y_fit_scaled):
+    """
+    Build the weighted, column-normalized design matrix that SINDy uses,
+    so BINDy runs on exactly the same features.
+    Returns (Theta_n, Yw, scales, sqrtw).
+    """
+    w_comp = component_row_weights(y_fit_scaled)
+    w_rows = expand_row_weights(w_comp, len(D_fit))
+    sqrtw = np.sqrt(w_rows + 1e-30)
+
+    Y = y_fit_scaled.reshape(-1)
+    Yw = Y * sqrtw
+
+    Theta = build_theta(ds, library, D_fit, tau_fit)
+    Theta_w = Theta * sqrtw[:, None]
+
+    Theta_n, scales = normalize_columns(Theta_w)
+    return Theta_n, Yw, scales, sqrtw
 
 
 def hmcmc_generate_tensor_library(N=500, temperature=1.0, max_complexity=3, seed=0):
@@ -202,11 +230,13 @@ def fit_weighted_sindy(D_fit, tau_fit, y_fit_scaled, library, threshold, lambda_
     c_n = ds._sparse_regression(Theta_n, Yw)
     coeffs = c_n / scales
 
-    # >>> KEY FIX 3: softer “active” cutoff for the refit, so 0.007 survives
+    # >>> KEY FIX 3: softer “active” cutoff for the refit, so ~0.007 survives
     active = np.where(np.abs(coeffs) > threshold / 2.0)[0]
     if len(active) > 0:
         coeffs_refit = np.zeros_like(coeffs)
-        coeffs_refit[active] = np.linalg.lstsq(Theta_w[:, active], Yw, rcond=None)[0]
+        coeffs_refit[active] = np.linalg.lstsq(
+            Theta_w[:, active], Yw, rcond=None
+        )[0]
         coeffs = coeffs_refit
 
     loss = float(np.mean((Yw - Theta_w @ coeffs) ** 2))
@@ -251,7 +281,7 @@ def term_energy_report(D, tau, coeffs_unscaled, library, sample_cap=6000, seed=0
         print(f"  {rms: .6e}  |  {name}")
 
 
-# >>> KEY FIX 4: extract FENE-P pieces by correlation (handles name variants)
+# >>> KEY FIX 4: extract FENE-P pieces by behavior (handles name variants)
 def match_term_by_behavior(library, D_sub, tau_sub, proto_eval):
     ds = DynamicSINDy(threshold=0.0, lambda_reg=0.0, max_iter=1)
     best_j, best_cos = None, -1.0
@@ -280,13 +310,19 @@ def match_term_by_behavior(library, D_sub, tau_sub, proto_eval):
 if __name__ == "__main__":
     all_D, all_tau, all_y = [], [], []
 
+    # -----------------------------------------------------------
+    # 1. Generate training data from the truth model
+    # -----------------------------------------------------------
     for wi in WI_LIST:
         for gdot in GDOT_LIST:
             for tau0 in TAU0_LIST:
-                t, tau, D_hist, L, D = simulate_truth(DT, LT, wi, LM_TRUTH, ETA, gdot, tau0)
+                t, tau, D_hist, L, D = simulate_truth(
+                    DT, LT, wi, LM_TRUTH, ETA, gdot, tau0
+                )
                 tau1 = tau1_target(DT, tau, L)
                 y = make_global_target(wi, tau1, ETA, D_hist)
 
+                # skip early transient and downsample
                 skip = 30
                 idx = np.arange(skip, len(t) - skip, dtype=int)[::3]
 
@@ -303,8 +339,14 @@ if __name__ == "__main__":
     y_scale = np.max(np.abs(y_train)) + 1e-30
     y_train_s = y_train / y_scale
     print(f"Target scaling y_scale = {y_scale:.3e}")
-    print(f"Scaled target RMS = {np.sqrt(np.mean(y_train_s.reshape(-1)**2)):.3e}, max|y| = {np.max(np.abs(y_train_s)):.3e}")
+    print(
+        f"Scaled target RMS = {np.sqrt(np.mean(y_train_s.reshape(-1)**2)):.3e}, "
+        f"max|y| = {np.max(np.abs(y_train_s)):.3e}"
+    )
 
+    # -----------------------------------------------------------
+    # 2. HMCMC candidate library + pruning
+    # -----------------------------------------------------------
     print("\n[HMCMC] Generating candidate tensor library...")
     cand = hmcmc_generate_tensor_library(
         N=HMCMC_N_TERMS,
@@ -315,9 +357,19 @@ if __name__ == "__main__":
     print(f"\nCandidate tensor terms after filtering: {len(cand)}")
 
     rng = np.random.default_rng(SEED)
-    sub_idx = rng.choice(len(D_train), size=min(PRUNE_SUBSAMPLE_SAMPLES, len(D_train)), replace=False)
-    lib = prune_library_by_columns(cand, D_train[sub_idx], tau_train[sub_idx], y_train_s[sub_idx],
-                                   cos_thr=COL_DUP_COS_THR, cap=CAP_LIBRARY)
+    sub_idx = rng.choice(
+        len(D_train),
+        size=min(PRUNE_SUBSAMPLE_SAMPLES, len(D_train)),
+        replace=False,
+    )
+    lib = prune_library_by_columns(
+        cand,
+        D_train[sub_idx],
+        tau_train[sub_idx],
+        y_train_s[sub_idx],
+        cos_thr=COL_DUP_COS_THR,
+        cap=CAP_LIBRARY
+    )
 
     print(f"Library size after pruning/cap: {len(lib)}")
     print("\nLibrary terms (post-prune):")
@@ -326,14 +378,21 @@ if __name__ == "__main__":
     if len(lib) > 60:
         print(f"  ... ({len(lib)-60} more)")
 
+    # -----------------------------------------------------------
+    # 3. Fit weighted SINDy on a subset
+    # -----------------------------------------------------------
     if len(D_train) > FIT_SAMPLE_CAP:
         fit_idx = rng.choice(len(D_train), size=FIT_SAMPLE_CAP, replace=False)
     else:
         fit_idx = np.arange(len(D_train), dtype=int)
 
     coeffs_s, w_comp, loss = fit_weighted_sindy(
-        D_train[fit_idx], tau_train[fit_idx], y_train_s[fit_idx],
-        lib, threshold=THRESHOLD, lambda_reg=LAMBDA_REG
+        D_train[fit_idx],
+        tau_train[fit_idx],
+        y_train_s[fit_idx],
+        lib,
+        threshold=THRESHOLD,
+        lambda_reg=LAMBDA_REG
     )
 
     print("\n[SINDy] Done. Weighted scaled loss:", loss)
@@ -341,41 +400,160 @@ if __name__ == "__main__":
     print_model(coeffs_s, lib, "SINDy model for y (SCALED)")
     coeffs_unscaled = coeffs_s * y_scale
     print_model(coeffs_unscaled, lib, "SINDy model for y (UNSCALED)")
-    term_energy_report(D_train, tau_train, coeffs_unscaled, lib, sample_cap=6000, seed=SEED)
+    term_energy_report(D_train, tau_train, coeffs_unscaled, lib,
+                       sample_cap=6000, seed=SEED)
 
-    # Behavior-based matching for τ, tr(τ)*τ, tr(τ)*I
+    # -----------------------------------------------------------
+    # 4. Match SINDy terms to FENE-P structure and recover Lm
+    # -----------------------------------------------------------
     Dm = D_train[sub_idx]
     taum = tau_train[sub_idx]
 
     j_tau, cos_tau = match_term_by_behavior(lib, Dm, taum, lambda D, tau: tau)
-    j_ttt, cos_ttt = match_term_by_behavior(lib, Dm, taum, lambda D, tau: np.trace(tau) * tau)
-    j_ti,  cos_ti  = match_term_by_behavior(lib, Dm, taum, lambda D, tau: np.trace(tau) * np.eye(3))
+    j_ttt, cos_ttt = match_term_by_behavior(
+        lib, Dm, taum, lambda D, tau: np.trace(tau) * tau
+    )
+    j_ti, cos_ti = match_term_by_behavior(
+        lib, Dm, taum, lambda D, tau: np.trace(tau) * np.eye(3)
+    )
 
     print("\n[Match by behavior]")
-    print(f"  tau term match:           idx={j_tau}, cos={cos_tau:.6f}, name={lib[j_tau].name}")
-    print(f"  tr(tau)*tau term match:   idx={j_ttt}, cos={cos_ttt:.6f}, name={lib[j_ttt].name}")
-    print(f"  tr(tau)*I term match:     idx={j_ti},  cos={cos_ti:.6f},  name={lib[j_ti].name}")
+    print(
+        f"  tau term match:           idx={j_tau}, "
+        f"cos={cos_tau:.6f}, name={lib[j_tau].name}"
+    )
+    print(
+        f"  tr(tau)*tau term match:   idx={j_ttt}, "
+        f"cos={cos_ttt:.6f}, name={lib[j_ttt].name}"
+    )
+    print(
+        f"  tr(tau)*I term match:     idx={j_ti},  "
+        f"cos={cos_ti:.6f},  name={lib[j_ti].name}"
+    )
 
     ctau = float(coeffs_unscaled[j_tau])
-    ctt  = float(coeffs_unscaled[j_ttt])
-    cti  = float(coeffs_unscaled[j_ti])
+    ctt = float(coeffs_unscaled[j_ttt])
+    cti = float(coeffs_unscaled[j_ti])
 
     invLm2 = 0.5 * (abs(ctt) + abs(cti))
     if invLm2 > 0:
         Lm_hat = float(np.sqrt(1.0 / invLm2))
-        print("\n=== Recovered compact FENE-P coefficients (from matched terms) ===")
+        print("\n=== Recovered compact FENE-P coefficients (SINDy) ===")
         print(f"  coeff(tau)           ≈ {ctau:.6f}   (truth -1)")
-        print(f"  coeff(tr(tau)*tau)   ≈ {ctt:.6f}   (truth -1/Lm^2 = -0.04)")
-        print(f"  coeff(tr(tau)*I)     ≈ {cti:.6f}   (truth -1/Lm^2 = -0.04)")
+        print(
+            f"  coeff(tr(tau)*tau)   ≈ {ctt:.6f}   "
+            f"(truth -1/Lm^2 = -0.04)"
+        )
+        print(
+            f"  coeff(tr(tau)*I)     ≈ {cti:.6f}   "
+            f"(truth -1/Lm^2 = -0.04)"
+        )
         print(f"  => inferred 1/Lm^2   ≈ {invLm2:.6f}")
         print(f"  => inferred Lm       ≈ {Lm_hat:.6f}   (truth {LM_TRUTH})")
     else:
-        print("\n[WARN] Could not infer Lm (trace-term coefficients too small/zero). Lower THRESHOLD further.")
+        print(
+            "\n[WARN] Could not infer Lm (trace-term coefficients too "
+            "small/zero). Lower THRESHOLD further."
+        )
 
+    # -----------------------------------------------------------
+    # 5. BINDy: RJMCMC on same weighted/normalized design
+    # -----------------------------------------------------------
+    print("\n[BINDy] Running RJMCMC on same weighted/normalized design...")
+
+    ds_tmp = DynamicSINDy(threshold=0.0, lambda_reg=0.0, max_iter=1)
+    D_fit = D_train[fit_idx]
+    tau_fit = tau_train[fit_idx]
+    y_fit_scaled = y_train_s[fit_idx]
+
+    Theta_n, Yw, scales, sqrtw = build_weighted_design(
+        ds_tmp, lib, D_fit, tau_fit, y_fit_scaled
+    )
+
+    D_terms = Theta_n.shape[1]
+    term_complexities = [t.complexity for t in lib]
+
+    mu0 = np.zeros(D_terms)
+    Sigma0_diag = 1e3 * np.ones(D_terms)
+
+    bindy = BINDyRJ(
+        Theta_n,
+        Yw,
+        mu0=mu0,
+        Sigma0_diag=Sigma0_diag,
+        term_complexity=term_complexities,
+        a0=1e-3,
+        b0=1e-3,
+        model_prior="geo_complexity",
+        theta_geom=0.98,
+        complexity_weight=1.0,
+        n_steps=6000,
+        burn_in=1000,
+        min_active=3,
+        seed=SEED,
+    )
+
+    masks, sigma2s = bindy.sample(init_model="full", init_sigma2=1.0)
+
+    inclusion_probs = masks.mean(axis=0)
+    print("\n=== BINDy term inclusion probabilities ===")
+    for j, term in enumerate(lib):
+        print(f"{j:3d}: p={inclusion_probs[j]:.3f}   {term.name}")
+
+    coeffs_bindy_norm = bindy.compute_posterior_mean_xi(masks, sigma2s)
+    coeffs_bindy_weighted = coeffs_bindy_norm / scales
+    coeffs_bindy_unscaled = coeffs_bindy_weighted * y_scale
+
+    print_model(
+        coeffs_bindy_unscaled,
+        lib,
+        "BINDy model for y (UNSCALED)"
+    )
+    term_energy_report(
+        D_train,
+        tau_train,
+        coeffs_bindy_unscaled,
+        lib,
+        sample_cap=6000,
+        seed=SEED,
+    )
+
+    # Recover FENE-P parameters from BINDy model using the same matched indices
+    ctau_B = float(coeffs_bindy_unscaled[j_tau])
+    ctt_B = float(coeffs_bindy_unscaled[j_ttt])
+    cti_B = float(coeffs_bindy_unscaled[j_ti])
+
+    invLm2_B = 0.5 * (abs(ctt_B) + abs(cti_B))
+    if invLm2_B > 0:
+        Lm_hat_B = float(np.sqrt(1.0 / invLm2_B))
+        print("\n=== Recovered compact FENE-P from BINDy ===")
+        print(f"  coeff(tau)           ≈ {ctau_B:.6f}   (truth -1)")
+        print(
+            f"  coeff(tr(tau)*tau)   ≈ {ctt_B:.6f}   "
+            f"(truth -1/Lm^2 = -0.04)"
+        )
+        print(
+            f"  coeff(tr(tau)*I)     ≈ {cti_B:.6f}   "
+            f"(truth -1/Lm^2 = -0.04)"
+        )
+        print(f"  => inferred 1/Lm^2   ≈ {invLm2_B:.6f}")
+        print(f"  => inferred Lm       ≈ {Lm_hat_B:.6f}   (truth {LM_TRUTH})")
+    else:
+        print(
+            "\n[BINDy] Could not infer Lm (trace-term coefficients too small)."
+        )
+
+    # -----------------------------------------------------------
+    # 6. Save SINDy results (BINDy can be added similarly if you want)
+    # -----------------------------------------------------------
     np.savez_compressed(
         os.path.join(OUTDIR, "hmcmc_fenep_discovery_v2.npz"),
-        dt=DT, Lt=LT, eta=ETA, Lm_truth=LM_TRUTH,
-        Wi_list=np.array(WI_LIST), gdot_list=np.array(GDOT_LIST),
+        dt=DT,
+        Lt=LT,
+        eta=ETA,
+        Lm_truth=LM_TRUTH,
+        Wi_list=np.array(WI_LIST),
+        gdot_list=np.array(GDOT_LIST),
         y_scale=y_scale,
         coeffs_scaled=coeffs_s,
         coeffs_unscaled=coeffs_unscaled,
